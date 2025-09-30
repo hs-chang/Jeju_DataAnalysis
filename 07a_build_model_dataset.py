@@ -1,0 +1,287 @@
+# 07a_build_model_dataset.py — 회귀 모델링용 코어 데이터셋 구축
+from pathlib import Path
+import re, csv
+import pandas as pd
+
+BASE = Path(__file__).resolve().parent
+RAW_DIR = BASE / "raw_data"
+OUT_DIR = BASE / "data_processed"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TARGET_REGIONS = [
+    "한경면","한림읍","애월읍","제주시","조천읍","구좌읍","추자면","우도면",
+    "대정읍","안덕면","서귀포시","남원읍","표선면","성산읍"
+]
+JEJU_TOWNS   = {"한경면","한림읍","애월읍","조천읍","구좌읍","추자면","우도면","제주시"}
+SEOGWI_TOWNS = {"대정읍","안덕면","남원읍","표선면","성산읍","서귀포시"}
+
+# ── 유틸 ─────────────────────────────────────────────────────────────
+def detect_header_and_sep(path: Path):
+    encs = ["cp949","euc-kr","utf-8-sig","utf-16","utf-16-le","utf-16-be","utf-8"]
+    header_idx, enc_best, sep_best, score_best = None, None, None, -1
+    tokens = ["시군구","법정동","읍면동","아파트","연립","전용","거래","건축","층","년","월","일","도로명","해제","등기","금액","가격","주소","단지"]
+    for enc in encs:
+        try:
+            with open(path, "r", encoding=enc, errors="ignore") as fh:
+                for i, line in enumerate(fh):
+                    s = line.strip()
+                    if len(s) < 3 or s.lower().startswith("sep="):
+                        continue
+                    counts = {",": line.count(","), "\t": line.count("\t"), ";": line.count(";"), "|": line.count("|")}
+                    tok = sum(t in line for t in tokens)
+                    sep_char, sep_cnt = max(counts.items(), key=lambda kv: kv[1])
+                    if (sep_cnt >= 8) and (tok >= 2):
+                        score = sep_cnt + tok*3
+                        if score > score_best:
+                            header_idx, enc_best, sep_best, score_best = i, enc, ("," if sep_char=="," else ("\t" if sep_char=="\t" else sep_char)), score
+        except Exception:
+            continue
+    return (enc_best or "cp949", (header_idx if header_idx is not None else 5), (sep_best or ","))
+
+def robust_read_one(path: Path) -> pd.DataFrame:
+    enc, skip, sep = detect_header_and_sep(path)
+    tries = [
+        dict(encoding=enc, sep=sep, engine="python", on_bad_lines="skip",
+             header=0, skiprows=skip, encoding_errors="replace"),
+        dict(encoding=enc, sep=sep, engine="python", on_bad_lines="skip",
+             header=0, skiprows=skip, quoting=csv.QUOTE_NONE,
+             escapechar="\\", quotechar='"', doublequote=False, encoding_errors="replace"),
+    ]
+    last = None
+    for kw in tries:
+        try:
+            df = pd.read_csv(path, **kw)
+            df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed", case=False, regex=True)]
+            df.columns = [str(c).replace("\u00A0"," ").strip() for c in df.columns]
+            if df.shape[1] > 1:
+                print(f"  -> OK {path.name} | enc={enc}, sep={'TAB' if sep=='\\t' else sep}, skiprows={skip}, shape={df.shape}")
+                return df
+        except Exception as e:
+            last = e
+    raise last if last else RuntimeError(f"로드 실패: {path}")
+
+def _norm_key(s: str) -> str:
+    import re as _re
+    s = str(s).lower().replace("\u00A0", " ")
+    return _re.sub(r"[\s()]", "", s)
+
+def to_num(s: pd.Series) -> pd.Series:
+    return (
+        s.astype(str)
+         .str.replace(",", "", regex=False)
+         .str.replace("\u00A0", "", regex=False)
+         .str.replace(r"[^0-9\.\-]", "", regex=True)
+         .pipe(pd.to_numeric, errors="coerce")
+    )
+
+# 날짜 만들기
+def build_date_series(df: pd.DataFrame) -> pd.Series | None:
+    cols = { _norm_key(c): c for c in df.columns }
+    y = next((cols[k] for k in cols if any(t in k for t in ["년","계약년","거래년"])), None)
+    m = next((cols[k] for k in cols if any(t in k for t in ["월","계약월","거래월"])), None)
+    d = next((cols[k] for k in cols if any(t in k for t in ["일","계약일","거래일"])), None)
+    if y and m and d:
+        ser = pd.to_datetime(dict(year=to_num(df[y]), month=to_num(df[m]), day=to_num(df[d])), errors="coerce")
+        if ser.notna().mean() > 0.3:
+            return ser
+    ym = next((c for c in df.columns if any(tok in _norm_key(c) for tok in ["계약년월","거래년월","년월"])), None)
+    if ym:
+        yms = df[ym].astype(str).str.replace(r"\D","",regex=True).str.zfill(6)
+        Y = pd.to_numeric(yms.str[:4], errors="coerce")
+        M = pd.to_numeric(yms.str[4:6], errors="coerce")
+        d2 = d or next((c for c in df.columns if any(tok in _norm_key(c) for tok in ["계약일","거래일","일"])), None)
+        if d2:
+            D = to_num(df[d2])
+            ser = pd.to_datetime(dict(year=Y, month=M, day=D), errors="coerce")
+        else:
+            ser = pd.to_datetime(dict(year=Y, month=M, day=1), errors="coerce")
+        if ser.notna().mean() > 0.3:
+            return ser
+    # 단일열 파싱
+    best, best_ratio = None, -1.0
+    for c in df.columns:
+        dt = pd.to_datetime(df[c], errors="coerce", infer_datetime_format=True)
+        ratio = dt.notna().mean()
+        if ratio < 0.3:
+            s2 = df[c].astype(str).str.replace(r"\D","",regex=True)
+            dt2 = pd.to_datetime(s2, format="%Y%m%d", errors="coerce")
+            ratio = dt2.notna().mean()
+            if ratio > best_ratio:
+                best_ratio, best = ratio, dt2
+        else:
+            if ratio > best_ratio:
+                best_ratio, best = ratio, dt
+    return best if (best is not None and best_ratio >= 0.5) else None
+
+# 열 찾기(가격/면적/층/건축년도/아파트명)
+def find_price_col(df):  # ‘금액/가격’ 포함 + 날짜형 숫자 배제
+    cols = list(df.columns)
+    cand = [c for c in cols if ("금액" in c or "가격" in c) and not any(w in c for w in ["년","월","일","일자","날짜","년월"])]
+    if not cand: cand = cols
+    best, best_key = None, (-1.0, 0.0)
+    for c in cand:
+        num = to_num(df[c]); valid = num.notna().mean()
+        if valid < 0.3: continue
+        yyyymm   = num.between(199001, 203512) & num.mod(100).between(1,12)
+        yyyymmdd = num.between(19900101, 20351231) & num.mod(100).between(1,31)
+        if max(yyyymm.mean(), yyyymmdd.mean()) >= 0.3: continue
+        med = num.median(skipna=True)
+        score = valid + (0.3 if 300 <= med <= 1_500_000 else 0.0)
+        if (score, med) > best_key:
+            best_key, best = (score, med), c
+    return best
+
+def find_area_col(df):
+    pri = [c for c in df.columns if ("전용" in c and "면적" in c)] or [c for c in df.columns if "면적" in c]
+    best, best_key = None, (-1.0, 0.0)
+    for c in pri:
+        num = to_num(df[c]); valid = num.notna().mean()
+        if valid < 0.3: continue
+        med = num.median(skipna=True)
+        score = valid + (0.3 if 10 <= med <= 300 else 0.0)
+        if (score, med) > best_key:
+            best_key, best = (score, med), c
+    return best
+
+def find_floor_col(df):
+    # '층'이 들어간 컬럼 최우선, 없으면 'FL'같은 약자도 탐색
+    cands = [c for c in df.columns if "층" in c] or [c for c in df.columns if re.search(r"\bfl(oor)?\b", c, re.I)]
+    for c in cands:
+        if to_num(df[c]).notna().mean() > 0.2:
+            return c
+    return None
+
+def find_buildyear_col(df):
+    cands = [c for c in df.columns if "건축" in c and "년" in c] or [c for c in df.columns if "건축년도" in c or "준공" in c]
+    for c in cands:
+        num = to_num(df[c])
+        if num.between(1970, 2035).mean() > 0.2:
+            return c
+    return None
+
+def find_aptname_col(df):
+    for key in ["아파트","아파트명","단지명","건물명","주택명"]:
+        hit = next((c for c in df.columns if _norm_key(key) in _norm_key(c)), None)
+        if hit: return hit
+    return None
+
+# 도시/행정구역
+def extract_city(df: pd.DataFrame) -> pd.Series:
+    prefer = ["읍면동","읍면동명","법정동","법정동명","행정동","행정동명","지번","지번주소","도로명","도로명주소","주소","시군구","시군구명"]
+    # 우선순위 이름을 실제 컬럼과 매칭
+    cand_cols = []
+    for p in prefer:
+        m = next((c for c in df.columns if _norm_key(c)==_norm_key(p)), None)
+        if m: cand_cols.append(m)
+    if not cand_cols:
+        cand_cols = [c for c in df.columns if any(k in c for k in ["주소","읍","면","동","시군구","시"])]
+        if not cand_cols: return pd.Series([None]*len(df))
+
+    def pick_city(row):
+        t = " ".join(str(row[c]) for c in cand_cols if c in row and pd.notna(row[c]))
+        t = t.replace("\u00A0"," ")
+        if any(r in t for r in SEOGWI_TOWNS): return "서귀포시"
+        if any(r in t for r in JEJU_TOWNS):   return "제주시"
+        if "서귀포시" in t: return "서귀포시"
+        if "제주시"   in t: return "제주시"
+        return None
+    return df.apply(pick_city, axis=1)
+
+def extract_region(df: pd.DataFrame) -> pd.Series:
+    # TARGET_REGIONS에 매칭되면 그 값, 없으면 city로 폴백
+    prefer = ["읍면동","읍면동명","법정동","법정동명","행정동","행정동명","도로명주소","지번주소","주소","시군구","시군구명"]
+    cand_cols = []
+    for p in prefer:
+        m = next((c for c in df.columns if _norm_key(c)==_norm_key(p)), None)
+        if m: cand_cols.append(m)
+    if not cand_cols:
+        return pd.Series([None]*len(df))
+
+    def pick_region(row):
+        t = " ".join(str(row[c]) for c in cand_cols if c in row and pd.notna(row[c]))
+        t = t.replace("\u00A0"," ")
+        for rg in TARGET_REGIONS:
+            if rg in t:
+                return rg
+        if "제주시" in t: return "제주시"
+        if "서귀포시" in t: return "서귀포시"
+        return None
+    return df.apply(pick_region, axis=1)
+
+# ── 메인 ─────────────────────────────────────────────────────────────
+def main():
+    files = sorted(
+        [p for p in RAW_DIR.iterdir() if p.is_file() and p.suffix.lower()==".csv"],
+        key=lambda p: int(re.search(r"(20\d{2})", p.stem).group(1)) if re.search(r"(20\d{2})", p.stem) else 0
+    )
+    if not files:
+        raise FileNotFoundError("raw_data에 .csv 파일이 없습니다.")
+
+    frames = []
+    for f in files:
+        print(f"\n=== {f.name} ===")
+        src = robust_read_one(f)
+
+        dt = build_date_series(src)
+        price_col = find_price_col(src)
+        area_col  = find_area_col(src)
+        floor_col = find_floor_col(src)
+        by_col    = find_buildyear_col(src)
+        name_col  = find_aptname_col(src)
+        city_ser  = extract_city(src)
+        region_ser= extract_region(src)
+
+        print(f"  · 날짜 유효비율: {0.0 if dt is None else round(dt.notna().mean(),3)}")
+        print(f"  · 가격열: {price_col} / 면적열: {area_col} / 층열: {floor_col} / 건축년도: {by_col} / 단지명: {name_col}")
+        print(f"  · 도시 샘플: {list(city_ser.dropna().astype(str).head(3))}")
+
+        if dt is None or price_col is None or area_col is None:
+            print("  ! 필수 컬럼 탐지 실패 → 스킵")
+            continue
+
+        df = pd.DataFrame({
+            "날짜": dt,
+            "가격_만원": to_num(src[price_col]),
+            "전용면적_㎡": to_num(src[area_col]),
+            "층": to_num(src[floor_col]) if floor_col else None,
+            "건축년도": to_num(src[by_col]) if by_col else None,
+            "단지명": src[name_col].astype(str).str.strip() if name_col else None,
+            "도시": city_ser,
+            "행정구역": region_ser
+        })
+        # 필수 필터
+        df = df.dropna(subset=["날짜","가격_만원","전용면적_㎡","도시"])
+        df = df[(df["가격_만원"] > 0) & (df["전용면적_㎡"] > 0)]
+
+        # 파생
+        df["년"] = df["날짜"].dt.year
+        df["월"] = df["날짜"].dt.month
+        df["만원_per_㎡"] = df["가격_만원"] / df["전용면적_㎡"]
+        # 비현실적 단가 제거
+        df = df[(df["만원_per_㎡"] > 1) & (df["만원_per_㎡"] < 2000)]
+
+        # 경과년수
+        df["경과년수"] = pd.NA
+        has_by = df["건축년도"].notna()
+        df.loc[has_by, "경과년수"] = df.loc[has_by, "년"] - df.loc[has_by, "건축년도"]
+
+        # 행정구역 폴백
+        df["행정구역"] = df["행정구역"].fillna(df["도시"])
+
+        frames.append(df)
+
+    if not frames:
+        raise ValueError("유효한 데이터가 없습니다. (날짜/가격/면적/도시 탐지 실패)")
+
+    model_df = pd.concat(frames, ignore_index=True).sort_values("날짜").reset_index(drop=True)
+
+    out = OUT_DIR / "jeju_modeling_dataset.csv"
+    model_df.to_csv(out, index=False, encoding="utf-8-sig")
+    print(f"\n[저장 완료] {out} | rows={len(model_df)}")
+    print("\n[컬럼 요약]")
+    print(model_df.columns.tolist())
+    print("\n[샘플 10행]")
+    print(model_df.head(10).to_string(index=False))
+
+if __name__ == "__main__":
+    main()
